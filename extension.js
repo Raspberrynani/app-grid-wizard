@@ -47,14 +47,14 @@ class AppFolderManager {
     }
 
     clearFolders() {
-        log('App-Grid-Wizard: Clearing folders...');
+        console.log('App-Grid-Wizard: Clearing folders...');
         try {
             this._folderSettings.set_strv('folder-children', []);
             Gio.Settings.sync();
             this._refreshAppDisplay();
-            log('App-Grid-Wizard: Folders cleared');
+            console.log('App-Grid-Wizard: Folders cleared');
         } catch (error) {
-            logError(error, 'App-Grid-Wizard: Error clearing folders');
+            console.error(error, 'App-Grid-Wizard: Error clearing folders');
         }
     }
 
@@ -97,13 +97,13 @@ class WizardToggle extends QuickToggle {
     }
 
     _startMonitoring() {
-        log('App-Grid-Wizard: Started monitoring for app changes');
+        console.log('App-Grid-Wizard: Started monitoring for app changes');
 
         if (this._monitorId) return;
 
         const appSystem = Shell.AppSystem.get_default();
         this._monitorId = appSystem.connect('installed-changed', () => {
-            log('App-Grid-Wizard: Detected app installation/removal');
+            console.log('App-Grid-Wizard: Detected app installation/removal');
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
                 this._folderManager.setupFolders();
                 return GLib.SOURCE_REMOVE;
@@ -115,7 +115,7 @@ class WizardToggle extends QuickToggle {
         if (this._monitorId) {
             Shell.AppSystem.get_default().disconnect(this._monitorId);
             this._monitorId = null;
-            log('App-Grid-Wizard: Stopped monitoring');
+            console.log('App-Grid-Wizard: Stopped monitoring');
         }
     }
 
@@ -152,5 +152,6 @@ export default class WizardManagerExtension extends Extension {
     disable() {
         this._indicator.quickSettingsItems.forEach(item => item.destroy());
         this._indicator.destroy();
+	this._indicator = null;
     }
 }
