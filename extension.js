@@ -60,7 +60,11 @@ class AppFolderManager {
 
     _refreshAppDisplay() {
         const appDisplay = Main.overview.viewSelector?._appDisplay || Main.overview.viewSelector?.appDisplay;
-        appDisplay?._redisplay();
+        if (appDisplay) {
+            appDisplay._redisplay();
+            Main.overview.viewSelector._overview.controls._thumbnailsBox.get_children().forEach(child => child.destroy());
+            Main.overview.viewSelector._overview.controls._thumbnailsBox._redisplay();
+        }
     }
 }
 
@@ -76,14 +80,11 @@ class WizardToggle extends QuickToggle {
         this._folderManager = new AppFolderManager();
         this._monitorId = null;
 
-        // Restore the toggle state based on existing folders
-        this.checked = this._folderManager._folderSettings.get_strv('folder-children').length > 0;
+	// Explicitly set the toggle state to false by default
+        this.checked = false;
+	
+	// Connect the click event
         this.connect('clicked', this._onClicked.bind(this));
-
-        // Start monitoring if the toggle is already checked
-        if (this.checked) {
-            this._startMonitoring();
-        }
     }
 
     _onClicked() {
@@ -104,8 +105,10 @@ class WizardToggle extends QuickToggle {
         const appSystem = Shell.AppSystem.get_default();
         this._monitorId = appSystem.connect('installed-changed', () => {
             console.log('App-Grid-Wizard: Detected app installation/removal');
+            console.log('App-Grid-Wizard: Updating App Folders...');
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
                 this._folderManager.setupFolders();
+                console.log("App-Grid-Wizard: App Folders Updated.");
                 return GLib.SOURCE_REMOVE;
             });
         });
@@ -147,6 +150,24 @@ export default class WizardManagerExtension extends Extension {
     enable() {
         this._indicator = new WizardIndicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+
+	// Ensure the toggle is off when the extension is enabled
+        const toggle = this._indicator.quickSettingsItems.find(item => item instanceof WizardToggle);
+        if (toggle) {
+	    toggle.checked = false;
+	}
+
+        // Add a delay for the initial setup
+        console.log('App-Grid-Wizard: Started Initial app folder creation.');
+	GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+            const toggle = this._indicator.quickSettingsItems.find(item => item instanceof WizardToggle);
+            if (toggle && !toggle.checked) {
+                toggle.checked = true;
+                toggle._onClicked();
+            }
+            console.log('App-Grid-Wizard: End of Initial app folder creation.');
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     disable() {
