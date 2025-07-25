@@ -11,6 +11,7 @@ import {QuickToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quick
 const SHOW_INDICATOR = false;
 const APP_FOLDER_SCHEMA_ID = 'org.gnome.desktop.app-folders';
 const APP_FOLDER_SCHEMA_PATH = '/org/gnome/desktop/app-folders/folders/';
+const DEBOUNCE_DELAY = 500; // Reduced from 1000ms
 
 // Folder configurations
 const FOLDER_CONFIGS = {
@@ -32,17 +33,85 @@ const FOLDER_CONFIGS = {
 class AppFolderManager {
     constructor() {
         this._folderSettings = new Gio.Settings({schema_id: APP_FOLDER_SCHEMA_ID});
+        this._folderSchemas = new Map(); // Cache folder schemas
+        this._setupTimeoutId = null;
+        this._isSettingUp = false;
+    }
+
+    _getFolderSchema(folderId) {
+        if (!this._folderSchemas.has(folderId)) {
+            const folderPath = `${APP_FOLDER_SCHEMA_PATH}${folderId}/`;
+            const folderSchema = Gio.Settings.new_with_path('org.gnome.desktop.app-folders.folder', folderPath);
+            this._folderSchemas.set(folderId, folderSchema);
+        }
+        return this._folderSchemas.get(folderId);
+    }
+
+    setupFoldersDebounced() {
+        // Cancel any pending setup
+        if (this._setupTimeoutId) {
+            GLib.source_remove(this._setupTimeoutId);
+            this._setupTimeoutId = null;
+        }
+
+        // Skip if already setting up
+        if (this._isSettingUp) {
+            return;
+        }
+
+        this._setupTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DEBOUNCE_DELAY, () => {
+            this.setupFolders();
+            this._setupTimeoutId = null;
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     setupFolders() {
-        this._folderSettings.set_strv('folder-children', Object.keys(FOLDER_CONFIGS));
+        if (this._isSettingUp) {
+            return;
+        }
 
-        for (const [folderId, config] of Object.entries(FOLDER_CONFIGS)) {
-            const folderPath = `${APP_FOLDER_SCHEMA_PATH}${folderId}/`;
-            const folderSchema = Gio.Settings.new_with_path('org.gnome.desktop.app-folders.folder', folderPath);
+        this._isSettingUp = true;
 
-            folderSchema.set_string('name', config.name);
-            folderSchema.set_strv('categories', config.categories);
+        try {
+            // Get current folder children to avoid unnecessary updates
+            const currentFolders = this._folderSettings.get_strv('folder-children');
+            const targetFolders = Object.keys(FOLDER_CONFIGS);
+            
+            // Only update if different
+            if (!this._arraysEqual(currentFolders, targetFolders)) {
+                this._folderSettings.set_strv('folder-children', targetFolders);
+            }
+
+            // Batch folder updates
+            const updates = [];
+            for (const [folderId, config] of Object.entries(FOLDER_CONFIGS)) {
+                const folderSchema = this._getFolderSchema(folderId);
+                
+                // Only update if values are different
+                if (folderSchema.get_string('name') !== config.name) {
+                    updates.push(() => folderSchema.set_string('name', config.name));
+                }
+                
+                const currentCategories = folderSchema.get_strv('categories');
+                if (!this._arraysEqual(currentCategories, config.categories)) {
+                    updates.push(() => folderSchema.set_strv('categories', config.categories));
+                }
+            }
+
+            // Apply all updates
+            updates.forEach(update => update());
+
+            // Single sync call instead of multiple
+            if (updates.length > 0) {
+                Gio.Settings.sync();
+                this._refreshAppDisplayOptimized();
+            }
+
+        } catch (error) {
+            console.error('App-Grid-Wizard: Error setting up folders:', error);
+        } finally {
+            this._isSettingUp = false;
         }
     }
 
@@ -51,20 +120,43 @@ class AppFolderManager {
         try {
             this._folderSettings.set_strv('folder-children', []);
             Gio.Settings.sync();
-            this._refreshAppDisplay();
+            this._refreshAppDisplayOptimized();
             console.log('App-Grid-Wizard: Folders cleared');
         } catch (error) {
-            console.error(error, 'App-Grid-Wizard: Error clearing folders');
+            console.error('App-Grid-Wizard: Error clearing folders:', error);
         }
     }
 
-    _refreshAppDisplay() {
-        const appDisplay = Main.overview.viewSelector?._appDisplay || Main.overview.viewSelector?.appDisplay;
-        if (appDisplay) {
-            appDisplay._redisplay();
-            Main.overview.viewSelector._overview.controls._thumbnailsBox.get_children().forEach(child => child.destroy());
-            Main.overview.viewSelector._overview.controls._thumbnailsBox._redisplay();
+    _arraysEqual(a, b) {
+        return a.length === b.length && a.every((val, i) => val === b[i]);
+    }
+
+    _refreshAppDisplayOptimized() {
+        // Use idle callback to avoid blocking UI
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            try {
+                const appDisplay = Main.overview.viewSelector?._appDisplay || 
+                                 Main.overview.viewSelector?.appDisplay ||
+                                 Main.overview._overview?.viewSelector?._appDisplay;
+                
+                if (appDisplay && appDisplay._redisplay) {
+                    appDisplay._redisplay();
+                }
+            } catch (error) {
+                console.error('App-Grid-Wizard: Error refreshing app display:', error);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    destroy() {
+        if (this._setupTimeoutId) {
+            GLib.source_remove(this._setupTimeoutId);
+            this._setupTimeoutId = null;
         }
+        
+        // Clear cached schemas
+        this._folderSchemas.clear();
     }
 }
 
@@ -79,11 +171,8 @@ class WizardToggle extends QuickToggle {
 
         this._folderManager = new AppFolderManager();
         this._monitorId = null;
-
-	// Explicitly set the toggle state to false by default
         this.checked = false;
-	
-	// Connect the click event
+        
         this.connect('clicked', this._onClicked.bind(this));
     }
 
@@ -105,18 +194,15 @@ class WizardToggle extends QuickToggle {
         const appSystem = Shell.AppSystem.get_default();
         this._monitorId = appSystem.connect('installed-changed', () => {
             console.log('App-Grid-Wizard: Detected app installation/removal');
-            console.log('App-Grid-Wizard: Updating App Folders...');
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
-                this._folderManager.setupFolders();
-                console.log("App-Grid-Wizard: App Folders Updated.");
-                return GLib.SOURCE_REMOVE;
-            });
+            // Use debounced setup to avoid multiple rapid updates
+            this._folderManager.setupFoldersDebounced();
         });
     }
 
     _stopMonitoring() {
         if (this._monitorId) {
-            Shell.AppSystem.get_default().disconnect(this._monitorId);
+            const appSystem = Shell.AppSystem.get_default();
+            appSystem.disconnect(this._monitorId);
             this._monitorId = null;
             console.log('App-Grid-Wizard: Stopped monitoring');
         }
@@ -124,6 +210,7 @@ class WizardToggle extends QuickToggle {
 
     destroy() {
         this._stopMonitoring();
+        this._folderManager.destroy();
         super.destroy();
     }
 });
@@ -133,16 +220,19 @@ class WizardIndicator extends SystemIndicator {
     _init() {
         super._init();
 
-        const toggle = new WizardToggle();
+        this._toggle = new WizardToggle();
         
         if (SHOW_INDICATOR) {
             this._indicator = this._addIndicator();
             this._indicator.iconName = 'view-grid-symbolic';
-
-            toggle.bind_property('checked', this._indicator, 'visible', GObject.BindingFlags.SYNC_CREATE);
+            this._toggle.bind_property('checked', this._indicator, 'visible', GObject.BindingFlags.SYNC_CREATE);
         }
 
-        this.quickSettingsItems.push(toggle);
+        this.quickSettingsItems.push(this._toggle);
+    }
+
+    getToggle() {
+        return this._toggle;
     }
 });
 
@@ -151,28 +241,35 @@ export default class WizardManagerExtension extends Extension {
         this._indicator = new WizardIndicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
-	// Ensure the toggle is off when the extension is enabled
-        const toggle = this._indicator.quickSettingsItems.find(item => item instanceof WizardToggle);
+        const toggle = this._indicator.getToggle();
         if (toggle) {
-	    toggle.checked = false;
-	}
+            toggle.checked = false;
+        }
 
-        // Add a delay for the initial setup
+        // Reduced initial delay and optimized setup
         console.log('App-Grid-Wizard: Started Initial app folder creation.');
-	GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
-            const toggle = this._indicator.quickSettingsItems.find(item => item instanceof WizardToggle);
+        this._initTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+            const toggle = this._indicator.getToggle();
             if (toggle && !toggle.checked) {
                 toggle.checked = true;
                 toggle._onClicked();
             }
             console.log('App-Grid-Wizard: End of Initial app folder creation.');
+            this._initTimeoutId = null;
             return GLib.SOURCE_REMOVE;
         });
     }
 
     disable() {
-        this._indicator.quickSettingsItems.forEach(item => item.destroy());
-        this._indicator.destroy();
-	this._indicator = null;
+        if (this._initTimeoutId) {
+            GLib.source_remove(this._initTimeoutId);
+            this._initTimeoutId = null;
+        }
+
+        if (this._indicator) {
+            this._indicator.quickSettingsItems.forEach(item => item.destroy());
+            this._indicator.destroy();
+            this._indicator = null;
+        }
     }
 }
